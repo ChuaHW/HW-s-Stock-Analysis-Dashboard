@@ -8,15 +8,25 @@ Run locally:
     pip install -r requirements.txt
     streamlit run app.py
 
-API keys (two required):
-    1. Finnhub (market data) — free, no credit card, 60 calls/minute.
+API keys (three required):
+    1. Finnhub (quotes, fundamentals, news, earnings) — free, no credit
+       card, 60 calls/minute.
        Get a key at: https://finnhub.io/register
        See `get_finnhub_api_key()` below for exactly where to put it.
        - Local dev:      set the FINNHUB_API_KEY environment variable
        - Streamlit Cloud: Advanced settings -> Secrets ->
                                FINNHUB_API_KEY = "..."
 
-    2. Google Gemini (LLM narrative) — free tier, no credit card.
+    2. Twelve Data (historical daily prices) — free, no credit card,
+       800 calls/day. Finnhub's historical-price endpoint is paid-only,
+       so this covers the SMA/pivot-point calculations instead.
+       Get a key at: https://twelvedata.com/pricing (Basic/free plan)
+       See `get_twelvedata_api_key()` below for exactly where to put it.
+       - Local dev:      set the TWELVEDATA_API_KEY environment variable
+       - Streamlit Cloud: Advanced settings -> Secrets ->
+                               TWELVEDATA_API_KEY = "..."
+
+    3. Google Gemini (LLM narrative) — free tier, no credit card.
        Get a key at: https://aistudio.google.com/apikey
        See `get_llm_client()` below for exactly where to put it.
        - Local dev:      set the GEMINI_API_KEY environment variable
@@ -30,6 +40,7 @@ from datetime import datetime, timedelta
 
 import finnhub
 import pandas as pd
+import requests
 import streamlit as st
 from google import genai
 from google.genai import types as genai_types
@@ -159,32 +170,65 @@ def _with_retry(func, retries: int = 3, base_delay: float = 2.0):
     raise last_exc
 
 
-def candles_to_dataframe(candles: dict) -> pd.DataFrame:
+def get_twelvedata_api_key():
     """
-    Converts a Finnhub /stock/candle response into an OHLCV DataFrame
-    shaped like {Open, High, Low, Close, Volume} indexed by date — this
-    matches what the technical-analysis functions below expect.
+    Returns the Twelve Data API key, or None if not configured.
+
+    >>> INSERT YOUR API KEY <<<
+    Get a free key (no credit card required, Basic plan) at
+    https://twelvedata.com/pricing
+    Set it as the environment variable TWELVEDATA_API_KEY, or (on Streamlit
+    Community Cloud) add TWELVEDATA_API_KEY under Advanced Settings -> Secrets.
+    Never hardcode the key directly in this file.
     """
-    if not candles or candles.get("s") != "ok":
-        return pd.DataFrame()
-    df = pd.DataFrame(
-        {
-            "Open": candles["o"],
-            "High": candles["h"],
-            "Low": candles["l"],
-            "Close": candles["c"],
-            "Volume": candles["v"],
-        },
-        index=pd.to_datetime(candles["t"], unit="s"),
+    api_key = os.environ.get("TWELVEDATA_API_KEY")
+    if not api_key:
+        try:
+            api_key = st.secrets["TWELVEDATA_API_KEY"]
+        except Exception:
+            api_key = None
+    return api_key
+
+
+# Cached for 30 minutes — Twelve Data's free tier is 800 calls/day, so
+# caching keeps repeat page loads from eating into that budget.
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_price_history(ticker: str, api_key: str) -> pd.DataFrame:
+    """
+    Daily OHLCV history from Twelve Data, shaped like {Open, High, Low,
+    Close, Volume} indexed by date — this is what Finnhub's historical
+    /stock/candle endpoint would have returned, but that endpoint is
+    paid-only on Finnhub's free tier, so this covers it instead.
+    """
+
+    def _load():
+        resp = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params={"symbol": ticker, "interval": "1day", "outputsize": 180, "apikey": api_key},
+            timeout=15,
+        )
+        data = resp.json()
+        if data.get("status") != "ok" or not data.get("values"):
+            raise RuntimeError(data.get("message", "Empty response from Twelve Data"))
+        return data["values"]
+
+    values = _with_retry(_load)
+
+    df = pd.DataFrame(values)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.rename(
+        columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}
     )
-    return df.sort_index()
+    return df.set_index("datetime").sort_index()[["Open", "High", "Low", "Close", "Volume"]]
 
 
 # Cached for 30 minutes — Finnhub's free tier is generous (60 calls/min),
 # but caching still avoids redundant work on repeat page loads.
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_ticker_data(ticker: str, api_key: str):
-    """Pulls everything needed from Finnhub in one cached call."""
+    """Pulls quote/fundamentals/news/earnings from Finnhub in one cached call."""
     client = finnhub.Client(api_key=api_key)
 
     def _load_core():
@@ -203,15 +247,6 @@ def fetch_ticker_data(ticker: str, api_key: str):
     profile, quote = _with_retry(_load_core)
 
     end = datetime.now()
-    start = end - timedelta(days=180)  # comfortably covers the 50-day SMA + 30-day pivot lookback
-    try:
-        candles = _with_retry(
-            lambda: client.stock_candles(ticker, "D", int(start.timestamp()), int(end.timestamp()))
-        )
-        hist = candles_to_dataframe(candles)
-    except Exception:
-        hist = pd.DataFrame()
-
     try:
         news = (
             client.company_news(
@@ -241,7 +276,7 @@ def fetch_ticker_data(ticker: str, api_key: str):
     except Exception:
         earnings = {}
 
-    return profile, quote, hist, news, metrics, earnings
+    return profile, quote, news, metrics, earnings
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -420,7 +455,7 @@ def get_current_narrative(client, ticker, news_items) -> str:
 st.sidebar.title("Market Intelligence")
 ticker_input = st.sidebar.text_input("Enter Stock Ticker", value="NVDA").upper().strip()
 st.sidebar.button("Analyze", type="primary", use_container_width=True)
-st.sidebar.caption("Data: Finnhub API. Narrative: Google Gemini API.")
+st.sidebar.caption("Data: Finnhub + Twelve Data. Narrative: Google Gemini API.")
 
 st.title("📈 Automated Market Intelligence Dashboard")
 
@@ -429,17 +464,24 @@ if not ticker_input:
     st.stop()
 
 finnhub_key = get_finnhub_api_key()
+twelvedata_key = get_twelvedata_api_key()
+missing_keys = []
 if not finnhub_key:
+    missing_keys.append("FINNHUB_API_KEY (get one at https://finnhub.io/register)")
+if not twelvedata_key:
+    missing_keys.append("TWELVEDATA_API_KEY (get one at https://twelvedata.com/pricing)")
+if missing_keys:
     st.error(
-        "No FINNHUB_API_KEY configured. Get a free key (no credit card "
-        "required) at https://finnhub.io/register, then set it as an "
-        "environment variable or Streamlit secret."
+        "Missing required API key(s):\n\n"
+        + "\n".join(f"- {k}" for k in missing_keys)
+        + "\n\nSet these as environment variables or Streamlit secrets."
     )
     st.stop()
 
 with st.spinner(f"Fetching data for {ticker_input}..."):
     try:
-        profile, quote, hist, news, metrics, earnings = fetch_ticker_data(ticker_input, finnhub_key)
+        profile, quote, news, metrics, earnings = fetch_ticker_data(ticker_input, finnhub_key)
+        hist = fetch_price_history(ticker_input, twelvedata_key)
     except Exception as e:
         st.error(f"Could not fetch data for '{ticker_input}': {e}")
         st.stop()
@@ -447,8 +489,8 @@ with st.spinner(f"Fetching data for {ticker_input}..."):
 if not quote or not quote.get("c") or hist.empty:
     st.error(
         f"No data returned for '{ticker_input}'. This usually means either the "
-        "symbol is wrong, or Finnhub is rate-limiting requests — if you're sure "
-        "the ticker is correct, wait a moment and click Analyze again."
+        "symbol is wrong, or Finnhub/Twelve Data is rate-limiting requests — "
+        "if you're sure the ticker is correct, wait a moment and click Analyze again."
     )
     st.stop()
 
@@ -596,4 +638,4 @@ with st.expander("🗞️ Current Market Narrative (Last 48 Hours)", expanded=Tr
         st.markdown(format_headlines(recent_news))
 
 st.divider()
-st.caption("Data provided by Finnhub. Not investment advice.")
+st.caption("Data provided by Finnhub and Twelve Data. Not investment advice.")

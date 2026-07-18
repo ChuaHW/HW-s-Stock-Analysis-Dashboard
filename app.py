@@ -9,11 +9,13 @@ Run locally:
     streamlit run app.py
 
 API key:
-    This app calls the Anthropic (Claude) API for the "Market Narrative"
-    section. See `get_llm_client()` below for exactly where to put your key.
-    - Local dev:      set the ANTHROPIC_API_KEY environment variable
+    This app calls the Google Gemini API (free tier) for the "Market
+    Narrative" section. See `get_llm_client()` below for exactly where to
+    put your key. Get a free key (no credit card required) at:
+        https://aistudio.google.com/apikey
+    - Local dev:      set the GEMINI_API_KEY environment variable
     - Streamlit Cloud: Advanced settings -> Secrets ->
-                            ANTHROPIC_API_KEY = "sk-ant-..."
+                            GEMINI_API_KEY = "AIza..."
 """
 
 import os
@@ -22,7 +24,8 @@ from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-import anthropic
+from google import genai
+from google.genai import types as genai_types
 
 # ============================================================================
 # CONFIG
@@ -34,7 +37,7 @@ st.set_page_config(
     layout="wide",
 )
 
-LLM_MODEL = "claude-opus-4-8"
+LLM_MODEL = "gemini-2.5-flash"
 
 # Industry -> 3-4 comparable peer tickers. Keys line up with yfinance's
 # `industry` field where possible; SECTOR_PEER_FALLBACK below covers
@@ -81,35 +84,38 @@ DEFAULT_PEERS = ["MSFT", "AAPL", "GOOGL", "AMZN"]
 
 def get_llm_client():
     """
-    Returns an anthropic.Anthropic client, or None if no key is configured.
+    Returns a google.genai.Client, or None if no key is configured.
 
     >>> INSERT YOUR API KEY <<<
-    Set it as the environment variable ANTHROPIC_API_KEY, or (on Streamlit
-    Community Cloud) add ANTHROPIC_API_KEY under Advanced Settings -> Secrets.
+    Get a free key (no credit card required) at https://aistudio.google.com/apikey
+    Set it as the environment variable GEMINI_API_KEY, or (on Streamlit
+    Community Cloud) add GEMINI_API_KEY under Advanced Settings -> Secrets.
     Never hardcode the key directly in this file.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         try:
-            api_key = st.secrets["ANTHROPIC_API_KEY"]
+            api_key = st.secrets["GEMINI_API_KEY"]
         except Exception:
             api_key = None
     if not api_key:
         return None
-    return anthropic.Anthropic(api_key=api_key)
+    return genai.Client(api_key=api_key)
 
 
-def call_claude(client, system_prompt: str, user_prompt: str, max_tokens: int = 300) -> str:
+def call_llm(client, system_prompt: str, user_prompt: str, max_tokens: int = 300) -> str:
     if client is None:
-        return "LLM analysis unavailable — no ANTHROPIC_API_KEY configured."
+        return "LLM analysis unavailable — no GEMINI_API_KEY configured."
     try:
-        response = client.messages.create(
+        response = client.models.generate_content(
             model=LLM_MODEL,
-            max_tokens=max_tokens,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
+            contents=user_prompt,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                max_output_tokens=max_tokens,
+            ),
         )
-        return next((b.text for b in response.content if b.type == "text"), "")
+        return response.text or ""
     except Exception as e:
         return f"LLM request failed: {e}"
 
@@ -308,7 +314,7 @@ def get_catalyst_analysis(client, ticker, move_date, pct_change, news_items) -> 
         "Explain in 2 sentences exactly why this stock moved significantly "
         "on this date based on these headlines."
     )
-    return call_claude(client, "You are a concise financial analyst.", prompt, max_tokens=200)
+    return call_llm(client, "You are a concise financial analyst.", prompt, max_tokens=200)
 
 
 def get_current_narrative(client, ticker, news_items) -> str:
@@ -319,7 +325,7 @@ def get_current_narrative(client, ticker, news_items) -> str:
         "Synthesize the current market sentiment and narrative for this "
         "stock into a tight, 3-sentence summary."
     )
-    return call_claude(client, "You are a concise financial analyst.", prompt, max_tokens=250)
+    return call_llm(client, "You are a concise financial analyst.", prompt, max_tokens=250)
 
 
 # ============================================================================
@@ -329,7 +335,7 @@ def get_current_narrative(client, ticker, news_items) -> str:
 st.sidebar.title("Market Intelligence")
 ticker_input = st.sidebar.text_input("Enter Stock Ticker", value="NVDA").upper().strip()
 st.sidebar.button("Analyze", type="primary", use_container_width=True)
-st.sidebar.caption("Data: Yahoo Finance (yfinance). Narrative: Claude API.")
+st.sidebar.caption("Data: Yahoo Finance (yfinance). Narrative: Google Gemini API.")
 
 st.title("📈 Automated Market Intelligence Dashboard")
 
@@ -465,8 +471,9 @@ st.header("Market Narrative — Catalysts & Sentiment")
 client = get_llm_client()
 if client is None:
     st.warning(
-        "No LLM API key detected. Set ANTHROPIC_API_KEY as an environment "
-        "variable or Streamlit secret to enable catalyst and narrative analysis."
+        "No LLM API key detected. Set GEMINI_API_KEY as an environment "
+        "variable or Streamlit secret to enable catalyst and narrative analysis. "
+        "Get a free key at https://aistudio.google.com/apikey"
     )
 
 move_date, move_pct = find_largest_move_date(hist, lookback_days=30)

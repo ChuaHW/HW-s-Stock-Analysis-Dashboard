@@ -197,10 +197,10 @@ def fetch_ticker_data(ticker: str, api_key: str):
             raise RuntimeError("Empty response from Finnhub (invalid ticker or rate limit)")
         return p, q
 
-    try:
-        profile, quote = _with_retry(_load_core)
-    except Exception:
-        profile, quote = {}, {}
+    # Let this propagate — the caller shows the real error message, and a
+    # failed call must not get cached (a silently-swallowed error here was
+    # previously cached as a "successful" empty result for 30 minutes).
+    profile, quote = _with_retry(_load_core)
 
     end = datetime.now()
     start = end - timedelta(days=180)  # comfortably covers the 50-day SMA + 30-day pivot lookback

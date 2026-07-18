@@ -8,23 +8,29 @@ Run locally:
     pip install -r requirements.txt
     streamlit run app.py
 
-API key:
-    This app calls the Google Gemini API (free tier) for the "Market
-    Narrative" section. See `get_llm_client()` below for exactly where to
-    put your key. Get a free key (no credit card required) at:
-        https://aistudio.google.com/apikey
-    - Local dev:      set the GEMINI_API_KEY environment variable
-    - Streamlit Cloud: Advanced settings -> Secrets ->
-                            GEMINI_API_KEY = "AIza..."
+API keys (two required):
+    1. Finnhub (market data) — free, no credit card, 60 calls/minute.
+       Get a key at: https://finnhub.io/register
+       See `get_finnhub_api_key()` below for exactly where to put it.
+       - Local dev:      set the FINNHUB_API_KEY environment variable
+       - Streamlit Cloud: Advanced settings -> Secrets ->
+                               FINNHUB_API_KEY = "..."
+
+    2. Google Gemini (LLM narrative) — free tier, no credit card.
+       Get a key at: https://aistudio.google.com/apikey
+       See `get_llm_client()` below for exactly where to put it.
+       - Local dev:      set the GEMINI_API_KEY environment variable
+       - Streamlit Cloud: Advanced settings -> Secrets ->
+                               GEMINI_API_KEY = "AIza..."
 """
 
 import os
 import time
 from datetime import datetime, timedelta
 
+import finnhub
 import pandas as pd
 import streamlit as st
-import yfinance as yf
 from google import genai
 from google.genai import types as genai_types
 
@@ -40,46 +46,35 @@ st.set_page_config(
 
 LLM_MODEL = "gemini-3.1-flash-lite"
 
-# Industry -> 3-4 comparable peer tickers. Keys line up with yfinance's
-# `industry` field where possible; SECTOR_PEER_FALLBACK below covers
-# anything not explicitly listed here.
-INDUSTRY_PEER_MAP = {
-    "Semiconductors": ["AMD", "INTC", "QCOM", "TXN"],
-    "Semiconductor Equipment & Materials": ["ASML", "AMAT", "LRCX", "KLAC"],
-    "Software - Infrastructure": ["MSFT", "ORCL", "CRM", "ADBE"],
-    "Software - Application": ["CRM", "ADBE", "INTU", "NOW"],
-    "Banks - Diversified": ["JPM", "BAC", "C", "WFC"],
-    "Banks - Regional": ["USB", "PNC", "TFC", "COF"],
-    "Internet Retail": ["AMZN", "EBAY", "ETSY", "SHOP"],
-    "Internet Content & Information": ["GOOGL", "META", "SNAP", "PINS"],
-    "Auto Manufacturers": ["TSLA", "GM", "F", "TM"],
-    "Oil & Gas Integrated": ["XOM", "CVX", "SHEL", "BP"],
-    "Drug Manufacturers - General": ["PFE", "MRK", "JNJ", "ABBV"],
-    "Credit Services": ["V", "MA", "AXP", "PYPL"],
-    "Consumer Electronics": ["AAPL", "SONY", "HPQ", "DELL"],
-    "Airlines": ["DAL", "UAL", "AAL", "LUV"],
-    "Aerospace & Defense": ["BA", "LMT", "RTX", "NOC"],
-}
-
-SECTOR_PEER_FALLBACK = {
-    "Technology": ["MSFT", "AAPL", "GOOGL", "META"],
-    "Financial Services": ["JPM", "BAC", "V", "MA"],
-    "Healthcare": ["JNJ", "PFE", "UNH", "ABBV"],
-    "Energy": ["XOM", "CVX", "COP", "SLB"],
-    "Consumer Cyclical": ["AMZN", "TSLA", "HD", "MCD"],
-    "Communication Services": ["GOOGL", "META", "NFLX", "DIS"],
-    "Industrials": ["HON", "UNP", "CAT", "GE"],
-    "Consumer Defensive": ["PG", "KO", "PEP", "WMT"],
-    "Utilities": ["NEE", "DUK", "SO", "D"],
-    "Real Estate": ["PLD", "AMT", "EQIX", "SPG"],
-    "Basic Materials": ["LIN", "SHW", "FCX", "NEM"],
-}
+# Industry keyword -> 3-4 comparable peer tickers. Matched via substring
+# search against Finnhub's `finnhubIndustry` classification string (Finnhub
+# doesn't expose a fixed sector/industry enum the way Yahoo does, so a
+# keyword match is more robust than an exact-string lookup table).
+INDUSTRY_KEYWORD_PEERS = [
+    (["semiconductor"], ["AMD", "INTC", "QCOM", "TXN"]),
+    (["bank"], ["JPM", "BAC", "C", "WFC"]),
+    (["software"], ["MSFT", "ORCL", "CRM", "ADBE"]),
+    (["internet", "e-commerce", "ecommerce"], ["AMZN", "EBAY", "ETSY", "SHOP"]),
+    (["media", "entertainment"], ["GOOGL", "META", "NFLX", "DIS"]),
+    (["auto", "vehicle"], ["TSLA", "GM", "F", "TM"]),
+    (["oil", "gas", "energy"], ["XOM", "CVX", "COP", "SLB"]),
+    (["pharma", "biotech", "drug"], ["PFE", "MRK", "JNJ", "ABBV"]),
+    (["insurance"], ["UNH", "CI", "ELV", "HUM"]),
+    (["airline"], ["DAL", "UAL", "AAL", "LUV"]),
+    (["aerospace", "defense"], ["BA", "LMT", "RTX", "NOC"]),
+    (["telecom"], ["T", "VZ", "TMUS", "CMCSA"]),
+    (["hardware", "electronics", "computer"], ["AAPL", "MSFT", "GOOGL", "HPQ"]),
+    (["retail"], ["WMT", "TGT", "COST", "HD"]),
+    (["real estate", "reit"], ["PLD", "AMT", "EQIX", "SPG"]),
+    (["utilit"], ["NEE", "DUK", "SO", "D"]),
+    (["metal", "mining", "material"], ["LIN", "SHW", "FCX", "NEM"]),
+]
 
 DEFAULT_PEERS = ["MSFT", "AAPL", "GOOGL", "AMZN"]
 
 
 # ============================================================================
-# LLM CLIENT
+# LLM CLIENT (Google Gemini)
 # ============================================================================
 
 
@@ -122,18 +117,36 @@ def call_llm(client, system_prompt: str, user_prompt: str, max_tokens: int = 300
 
 
 # ============================================================================
-# DATA FETCHING (yfinance)
+# DATA FETCHING (Finnhub)
 # ============================================================================
+
+
+def get_finnhub_api_key():
+    """
+    Returns the Finnhub API key, or None if not configured.
+
+    >>> INSERT YOUR API KEY <<<
+    Get a free key (no credit card required) at https://finnhub.io/register
+    Set it as the environment variable FINNHUB_API_KEY, or (on Streamlit
+    Community Cloud) add FINNHUB_API_KEY under Advanced Settings -> Secrets.
+    Never hardcode the key directly in this file.
+    """
+    api_key = os.environ.get("FINNHUB_API_KEY")
+    if not api_key:
+        try:
+            api_key = st.secrets["FINNHUB_API_KEY"]
+        except Exception:
+            api_key = None
+    return api_key
 
 
 def _with_retry(func, retries: int = 3, base_delay: float = 2.0):
     """
-    Retries a yfinance call with exponential backoff.
+    Retries an API call with exponential backoff.
 
-    Yahoo Finance rate-limits unofficial API traffic (HTTP 429 "Too Many
-    Requests"), which shows up often on shared-IP hosts like Streamlit
-    Community Cloud. Most of these are transient, so a short backoff
-    usually clears them without the user having to manually retry.
+    Free-tier data APIs (Finnhub included) can occasionally return a rate
+    limit or transient error. A short backoff usually clears it without the
+    user having to manually retry.
     """
     last_exc = None
     for attempt in range(retries):
@@ -146,46 +159,101 @@ def _with_retry(func, retries: int = 3, base_delay: float = 2.0):
     raise last_exc
 
 
-# Cached for 30 minutes — reduces how often the app re-hits Yahoo Finance,
-# which lowers the odds of tripping their rate limiter.
+def candles_to_dataframe(candles: dict) -> pd.DataFrame:
+    """
+    Converts a Finnhub /stock/candle response into an OHLCV DataFrame
+    shaped like {Open, High, Low, Close, Volume} indexed by date — this
+    matches what the technical-analysis functions below expect.
+    """
+    if not candles or candles.get("s") != "ok":
+        return pd.DataFrame()
+    df = pd.DataFrame(
+        {
+            "Open": candles["o"],
+            "High": candles["h"],
+            "Low": candles["l"],
+            "Close": candles["c"],
+            "Volume": candles["v"],
+        },
+        index=pd.to_datetime(candles["t"], unit="s"),
+    )
+    return df.sort_index()
+
+
+# Cached for 30 minutes — Finnhub's free tier is generous (60 calls/min),
+# but caching still avoids redundant work on repeat page loads.
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_ticker_data(ticker: str):
-    """Pulls everything needed from yfinance in one cached call."""
-    tk = yf.Ticker(ticker)
+def fetch_ticker_data(ticker: str, api_key: str):
+    """Pulls everything needed from Finnhub in one cached call."""
+    client = finnhub.Client(api_key=api_key)
 
     def _load_core():
-        i = tk.info or {}
-        h = tk.history(period="3mo")
-        # Yahoo sometimes rate-limits by silently returning an empty
-        # response instead of raising — treat that as a retryable failure
-        # too, rather than assuming the ticker itself is invalid.
-        if not i or h.empty:
-            raise RuntimeError("Empty response from Yahoo Finance (likely rate-limited)")
-        return i, h
+        p = client.company_profile2(symbol=ticker)
+        q = client.quote(ticker)
+        # An invalid ticker or a rate-limited request both come back as an
+        # empty/zeroed response rather than raising — treat that as a
+        # retryable failure instead of silently returning blank data.
+        if not p or not q or not q.get("c"):
+            raise RuntimeError("Empty response from Finnhub (invalid ticker or rate limit)")
+        return p, q
 
     try:
-        info, hist = _with_retry(_load_core)
+        profile, quote = _with_retry(_load_core)
     except Exception:
-        info, hist = {}, pd.DataFrame()
+        profile, quote = {}, {}
+
+    end = datetime.now()
+    start = end - timedelta(days=180)  # comfortably covers the 50-day SMA + 30-day pivot lookback
+    try:
+        candles = _with_retry(
+            lambda: client.stock_candles(ticker, "D", int(start.timestamp()), int(end.timestamp()))
+        )
+        hist = candles_to_dataframe(candles)
+    except Exception:
+        hist = pd.DataFrame()
 
     try:
-        news = tk.news or []
+        news = (
+            client.company_news(
+                ticker,
+                _from=(end - timedelta(days=30)).strftime("%Y-%m-%d"),
+                to=end.strftime("%Y-%m-%d"),
+            )
+            or []
+        )
     except Exception:
         news = []
+
     try:
-        calendar = tk.calendar
+        metrics = client.company_basic_financials(ticker, "all") or {}
     except Exception:
-        calendar = None
-    return info, hist, news, calendar
+        metrics = {}
+
+    try:
+        earnings = (
+            client.earnings_calendar(
+                _from=end.strftime("%Y-%m-%d"),
+                to=(end + timedelta(days=120)).strftime("%Y-%m-%d"),
+                symbol=ticker,
+            )
+            or {}
+        )
+    except Exception:
+        earnings = {}
+
+    return profile, quote, hist, news, metrics, earnings
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_peer_pe_ratios(peers: list) -> dict:
+def fetch_peer_pe_ratios(peers: list, api_key: str) -> dict:
+    client = finnhub.Client(api_key=api_key)
     pe_data = {}
     for peer in peers:
         try:
-            peer_info = _with_retry(lambda p=peer: yf.Ticker(p).info, retries=2, base_delay=1.5)
-            pe = peer_info.get("trailingPE")
+            metrics = _with_retry(
+                lambda p=peer: client.company_basic_financials(p, "all"), retries=2, base_delay=1.5
+            )
+            pe = (metrics.get("metric") or {}).get("peTTM")
             if pe and pe > 0:
                 pe_data[peer] = pe
         except Exception:
@@ -193,53 +261,32 @@ def fetch_peer_pe_ratios(peers: list) -> dict:
     return pe_data
 
 
-def get_next_earnings_date(calendar) -> str:
-    if calendar is None:
-        return "N/A"
+def get_next_earnings_date(earnings: dict) -> str:
     try:
-        if isinstance(calendar, dict):
-            dates = calendar.get("Earnings Date")
-        else:  # older yfinance returns a DataFrame
-            dates = calendar.loc["Earnings Date"].values if "Earnings Date" in calendar.index else None
-        if not dates:
-            return "N/A"
-        date_val = dates[0]
-        if hasattr(date_val, "strftime"):
-            return date_val.strftime("%Y-%m-%d")
-        return str(date_val)
+        calendar_entries = earnings.get("earningsCalendar") or []
+        dates = sorted(e.get("date") for e in calendar_entries if e.get("date"))
+        return dates[0] if dates else "N/A"
     except Exception:
         return "N/A"
 
 
 # ============================================================================
-# NEWS SCHEMA HELPERS
-# yfinance has shipped a couple of different shapes for `Ticker.news` over
-# time. These helpers normalize both so the rest of the app doesn't care.
+# NEWS HELPERS
 # ============================================================================
 
 
 def get_news_title(item: dict) -> str:
-    return item.get("title") or (item.get("content") or {}).get("title", "")
+    return item.get("headline", "")
 
 
 def get_news_publisher(item: dict) -> str:
-    publisher = item.get("publisher")
-    if publisher:
-        return publisher
-    provider = (item.get("content") or {}).get("provider") or {}
-    return provider.get("displayName", "")
+    return item.get("source", "")
 
 
 def get_news_datetime(item: dict):
-    ts = item.get("providerPublishTime")
-    if isinstance(ts, (int, float)):
+    ts = item.get("datetime")
+    if isinstance(ts, (int, float)) and ts > 0:
         return datetime.fromtimestamp(ts)
-    pub_date = (item.get("content") or {}).get("pubDate")
-    if pub_date:
-        try:
-            return pd.to_datetime(pub_date).tz_localize(None).to_pydatetime()
-        except Exception:
-            return None
     return None
 
 
@@ -292,11 +339,12 @@ def calculate_pivot_points(hist: pd.DataFrame, lookback_days: int = 30):
 # ============================================================================
 
 
-def get_sector_peers(info: dict, exclude_ticker: str) -> list:
-    industry = info.get("industry")
-    sector = info.get("sector")
-    peers = INDUSTRY_PEER_MAP.get(industry) or SECTOR_PEER_FALLBACK.get(sector) or DEFAULT_PEERS
-    return [p for p in peers if p.upper() != exclude_ticker.upper()][:4]
+def get_sector_peers(industry: str, exclude_ticker: str) -> list:
+    industry_lower = (industry or "").lower()
+    for keywords, peers in INDUSTRY_KEYWORD_PEERS:
+        if any(kw in industry_lower for kw in keywords):
+            return [p for p in peers if p.upper() != exclude_ticker.upper()][:4]
+    return [p for p in DEFAULT_PEERS if p.upper() != exclude_ticker.upper()][:4]
 
 
 def calculate_fair_value(sector_avg_pe, target_eps):
@@ -372,7 +420,7 @@ def get_current_narrative(client, ticker, news_items) -> str:
 st.sidebar.title("Market Intelligence")
 ticker_input = st.sidebar.text_input("Enter Stock Ticker", value="NVDA").upper().strip()
 st.sidebar.button("Analyze", type="primary", use_container_width=True)
-st.sidebar.caption("Data: Yahoo Finance (yfinance). Narrative: Google Gemini API.")
+st.sidebar.caption("Data: Finnhub API. Narrative: Google Gemini API.")
 
 st.title("📈 Automated Market Intelligence Dashboard")
 
@@ -380,28 +428,36 @@ if not ticker_input:
     st.info("Enter a ticker in the sidebar to begin.")
     st.stop()
 
+finnhub_key = get_finnhub_api_key()
+if not finnhub_key:
+    st.error(
+        "No FINNHUB_API_KEY configured. Get a free key (no credit card "
+        "required) at https://finnhub.io/register, then set it as an "
+        "environment variable or Streamlit secret."
+    )
+    st.stop()
+
 with st.spinner(f"Fetching data for {ticker_input}..."):
     try:
-        info, hist, news, calendar = fetch_ticker_data(ticker_input)
+        profile, quote, hist, news, metrics, earnings = fetch_ticker_data(ticker_input, finnhub_key)
     except Exception as e:
         st.error(f"Could not fetch data for '{ticker_input}': {e}")
         st.stop()
 
-if hist.empty or not info:
+if not quote or not quote.get("c") or hist.empty:
     st.error(
         f"No data returned for '{ticker_input}'. This usually means either the "
-        "symbol is wrong, or Yahoo Finance is temporarily rate-limiting requests "
-        "from this server — if you're sure the ticker is correct, wait a minute "
-        "and click Analyze again."
+        "symbol is wrong, or Finnhub is rate-limiting requests — if you're sure "
+        "the ticker is correct, wait a moment and click Analyze again."
     )
     st.stop()
 
-current_price = info.get("currentPrice") or info.get("regularMarketPrice") or hist["Close"].iloc[-1]
-company_name = info.get("longName", ticker_input)
-previous_close = info.get("previousClose", current_price)
+current_price = quote.get("c")
+company_name = profile.get("name", ticker_input)
+previous_close = quote.get("pc", current_price)
 price_change = current_price - previous_close if previous_close else 0
 price_change_pct = (price_change / previous_close * 100) if previous_close else 0
-next_earnings = get_next_earnings_date(calendar)
+next_earnings = get_next_earnings_date(earnings)
 
 # ============================================================================
 # UI — HEADER
@@ -471,9 +527,9 @@ st.divider()
 
 st.header("Fundamental Analysis — Relative Fair Value")
 
-peers = get_sector_peers(info, ticker_input)
-peer_pe = fetch_peer_pe_ratios(peers)
-target_eps = info.get("trailingEps")
+peers = get_sector_peers(profile.get("finnhubIndustry"), ticker_input)
+peer_pe = fetch_peer_pe_ratios(peers, finnhub_key)
+target_eps = (metrics.get("metric") or {}).get("epsTTM")
 sector_avg_pe = (sum(peer_pe.values()) / len(peer_pe)) if peer_pe else None
 fair_value = calculate_fair_value(sector_avg_pe, target_eps)
 
@@ -540,4 +596,4 @@ with st.expander("🗞️ Current Market Narrative (Last 48 Hours)", expanded=Tr
         st.markdown(format_headlines(recent_news))
 
 st.divider()
-st.caption("Data provided by Yahoo Finance via yfinance. Not investment advice.")
+st.caption("Data provided by Finnhub. Not investment advice.")

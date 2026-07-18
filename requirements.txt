@@ -1,4 +1,4 @@
 streamlit
-yfinance
+finnhub-python
 pandas
 google-genai

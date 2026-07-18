@@ -156,9 +156,17 @@ def fetch_ticker_data(ticker: str):
     def _load_core():
         i = tk.info or {}
         h = tk.history(period="3mo")
+        # Yahoo sometimes rate-limits by silently returning an empty
+        # response instead of raising — treat that as a retryable failure
+        # too, rather than assuming the ticker itself is invalid.
+        if not i or h.empty:
+            raise RuntimeError("Empty response from Yahoo Finance (likely rate-limited)")
         return i, h
 
-    info, hist = _with_retry(_load_core)
+    try:
+        info, hist = _with_retry(_load_core)
+    except Exception:
+        info, hist = {}, pd.DataFrame()
 
     try:
         news = tk.news or []
@@ -380,7 +388,12 @@ with st.spinner(f"Fetching data for {ticker_input}..."):
         st.stop()
 
 if hist.empty or not info:
-    st.error(f"No data found for ticker '{ticker_input}'. Please check the symbol.")
+    st.error(
+        f"No data returned for '{ticker_input}'. This usually means either the "
+        "symbol is wrong, or Yahoo Finance is temporarily rate-limiting requests "
+        "from this server — if you're sure the ticker is correct, wait a minute "
+        "and click Analyze again."
+    )
     st.stop()
 
 current_price = info.get("currentPrice") or info.get("regularMarketPrice") or hist["Close"].iloc[-1]

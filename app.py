@@ -19,6 +19,7 @@ API key:
 """
 
 import os
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -125,12 +126,40 @@ def call_llm(client, system_prompt: str, user_prompt: str, max_tokens: int = 300
 # ============================================================================
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+def _with_retry(func, retries: int = 3, base_delay: float = 2.0):
+    """
+    Retries a yfinance call with exponential backoff.
+
+    Yahoo Finance rate-limits unofficial API traffic (HTTP 429 "Too Many
+    Requests"), which shows up often on shared-IP hosts like Streamlit
+    Community Cloud. Most of these are transient, so a short backoff
+    usually clears them without the user having to manually retry.
+    """
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return func()
+        except Exception as e:
+            last_exc = e
+            if attempt < retries - 1:
+                time.sleep(base_delay * (2**attempt))
+    raise last_exc
+
+
+# Cached for 30 minutes — reduces how often the app re-hits Yahoo Finance,
+# which lowers the odds of tripping their rate limiter.
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_ticker_data(ticker: str):
     """Pulls everything needed from yfinance in one cached call."""
     tk = yf.Ticker(ticker)
-    info = tk.info or {}
-    hist = tk.history(period="3mo")
+
+    def _load_core():
+        i = tk.info or {}
+        h = tk.history(period="3mo")
+        return i, h
+
+    info, hist = _with_retry(_load_core)
+
     try:
         news = tk.news or []
     except Exception:
@@ -142,12 +171,12 @@ def fetch_ticker_data(ticker: str):
     return info, hist, news, calendar
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_peer_pe_ratios(peers: list) -> dict:
     pe_data = {}
     for peer in peers:
         try:
-            peer_info = yf.Ticker(peer).info
+            peer_info = _with_retry(lambda p=peer: yf.Ticker(p).info, retries=2, base_delay=1.5)
             pe = peer_info.get("trailingPE")
             if pe and pe > 0:
                 pe_data[peer] = pe

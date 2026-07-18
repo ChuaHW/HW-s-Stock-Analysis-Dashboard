@@ -38,7 +38,7 @@ st.set_page_config(
     layout="wide",
 )
 
-LLM_MODEL = "gemini-2.5-flash"
+LLM_MODEL = "gemini-3.1-flash-lite"
 
 # Industry -> 3-4 comparable peer tickers. Keys line up with yfinance's
 # `industry` field where possible; SECTOR_PEER_FALLBACK below covers

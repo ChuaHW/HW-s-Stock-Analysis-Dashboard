@@ -35,6 +35,7 @@ API keys (three required):
 """
 
 import os
+import statistics
 import time
 from datetime import datetime, timedelta
 
@@ -82,6 +83,11 @@ INDUSTRY_KEYWORD_PEERS = [
 ]
 
 DEFAULT_PEERS = ["MSFT", "AAPL", "GOOGL", "AMZN"]
+
+# Fundamental-analysis tuning knobs (see the framework in the README/commit).
+PEER_LIMIT = 20          # top-N peers by market cap to include in the median
+PE_OUTLIER_MAX = 200.0   # discard P/E above this as an extreme outlier
+HIST_PE_YEARS = 5        # window for the historical-average-P/E anchor multiple
 
 
 # ============================================================================
@@ -280,20 +286,51 @@ def fetch_ticker_data(ticker: str, api_key: str):
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_peer_pe_ratios(peers: list, api_key: str) -> dict:
+def fetch_peer_group(ticker: str, industry: str, api_key: str) -> list:
+    """
+    Dynamic sub-industry peer group from Finnhub's /stock/peers endpoint
+    (free tier, defaults to sub-industry grouping — the GICS-style peer
+    definition the framework's Part 1 calls for). Falls back to the static
+    keyword map if the endpoint returns nothing.
+    """
     client = finnhub.Client(api_key=api_key)
-    pe_data = {}
+    try:
+        peers = _with_retry(lambda: client.company_peers(ticker), retries=2, base_delay=1.5) or []
+    except Exception:
+        peers = []
+    peers = [p for p in peers if p and p.upper() != ticker.upper()]
+    if not peers:
+        peers = get_sector_peers_static(industry, ticker)
+    return peers[:PEER_LIMIT]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_peer_metrics(peers: list, api_key: str) -> list:
+    """
+    Per-peer trailing P/E, P/S, and market cap. (Forward P/E and EV/Sales,
+    which the framework ideally wants here, require analyst estimates that
+    are premium-only on Finnhub's free tier — trailing P/E is the free
+    proxy, and P/S backs the unprofitable-company valuation fallback.)
+    """
+    client = finnhub.Client(api_key=api_key)
+    rows = []
     for peer in peers:
         try:
-            metrics = _with_retry(
+            data = _with_retry(
                 lambda p=peer: client.company_basic_financials(p, "all"), retries=2, base_delay=1.5
             )
-            pe = (metrics.get("metric") or {}).get("peTTM")
-            if pe and pe > 0:
-                pe_data[peer] = pe
+            metric = data.get("metric") or {}
+            rows.append(
+                {
+                    "ticker": peer,
+                    "pe": metric.get("peTTM"),
+                    "ps": metric.get("psTTM"),
+                    "market_cap": metric.get("marketCapitalization"),
+                }
+            )
         except Exception:
             continue
-    return pe_data
+    return rows
 
 
 def get_next_earnings_date(earnings: dict) -> str:
@@ -374,18 +411,104 @@ def calculate_pivot_points(hist: pd.DataFrame, lookback_days: int = 30):
 # ============================================================================
 
 
-def get_sector_peers(industry: str, exclude_ticker: str) -> list:
+def get_sector_peers_static(industry: str, exclude_ticker: str) -> list:
+    """Fallback peer group when Finnhub's /stock/peers returns nothing."""
     industry_lower = (industry or "").lower()
     for keywords, peers in INDUSTRY_KEYWORD_PEERS:
         if any(kw in industry_lower for kw in keywords):
-            return [p for p in peers if p.upper() != exclude_ticker.upper()][:4]
-    return [p for p in DEFAULT_PEERS if p.upper() != exclude_ticker.upper()][:4]
+            return [p for p in peers if p.upper() != exclude_ticker.upper()]
+    return [p for p in DEFAULT_PEERS if p.upper() != exclude_ticker.upper()]
 
 
-def calculate_fair_value(sector_avg_pe, target_eps):
-    if not sector_avg_pe or target_eps is None:
+def metric_value(metrics: dict, *names):
+    """First present numeric value among candidate metric keys (Finnhub's
+    field names vary), else None."""
+    m = (metrics or {}).get("metric") or {}
+    for n in names:
+        v = m.get(n)
+        if isinstance(v, (int, float)):
+            return v
+    return None
+
+
+def normalize_growth(v):
+    """Finnhub growth fields are sometimes a percent (15.3) and sometimes a
+    decimal (0.153). Normalize to a decimal fraction."""
+    if not isinstance(v, (int, float)):
         return None
-    return sector_avg_pe * target_eps
+    return v / 100 if abs(v) > 3 else v
+
+
+def compute_sector_multiples(peer_rows: list) -> dict:
+    """
+    Part 1 — sector averages via the MEDIAN (mega-cap outliers skew a mean),
+    after cleansing: drop negative/zero P/E (unprofitable) and P/E above the
+    outlier cap, then keep the top-N valid peers by market cap.
+    """
+    valid = [
+        r for r in peer_rows
+        if isinstance(r.get("pe"), (int, float)) and 0 < r["pe"] <= PE_OUTLIER_MAX
+    ]
+    if any(r.get("market_cap") for r in valid):
+        valid = sorted(valid, key=lambda r: r.get("market_cap") or 0, reverse=True)[:PEER_LIMIT]
+    pes = [r["pe"] for r in valid]
+    pss = [r["ps"] for r in valid if isinstance(r.get("ps"), (int, float)) and r["ps"] > 0]
+    return {
+        "median_pe": statistics.median(pes) if pes else None,
+        "mean_pe": statistics.fmean(pes) if pes else None,
+        "median_ps": statistics.median(pss) if pss else None,
+        "valid_peers": valid,
+        "count": len(pes),
+    }
+
+
+def get_historical_avg_pe(metrics: dict, years: int = HIST_PE_YEARS):
+    """
+    5-year average trailing P/E from Finnhub's annual `series` (the anchor
+    multiple M_historical in Part 2). Returns None when the series isn't
+    available for this ticker/tier.
+    """
+    try:
+        annual = ((metrics or {}).get("series") or {}).get("annual") or {}
+        pe_series = annual.get("pe") or []
+        values = [
+            pt.get("v")
+            for pt in pe_series
+            if isinstance(pt.get("v"), (int, float)) and 0 < pt["v"] <= PE_OUTLIER_MAX
+        ]
+        values = values[:years]  # Finnhub returns the series newest-first
+        return statistics.fmean(values) if values else None
+    except Exception:
+        return None
+
+
+def estimate_forward_eps(eps_ttm, growth):
+    """NTM EPS proxy: trailing EPS grown one year (true consensus NTM EPS is
+    premium-only, so this is derived from EPS_ttm and the growth assumption)."""
+    if eps_ttm is None or growth is None:
+        return None
+    return eps_ttm * (1 + growth)
+
+
+def historical_multiple_fair_value(eps_fwd, m_historical):
+    """Part 2 — P_fair = EPS_fwd × M_historical."""
+    if eps_fwd is None or m_historical is None:
+        return None
+    return eps_fwd * m_historical
+
+
+def ps_fair_value(sector_median_ps, sales_per_share):
+    """Unprofitable-company fallback (EPS < 0): value on Price/Sales instead."""
+    if not sector_median_ps or not sales_per_share:
+        return None
+    return sector_median_ps * sales_per_share
+
+
+def scenario_target(eps_ttm, growth, multiple, t: int = 1):
+    """Part 3 — P_target = EPS_ttm × (1 + g)^t × M_target."""
+    if eps_ttm is None or multiple is None or growth is None:
+        return None
+    return eps_ttm * ((1 + growth) ** t) * multiple
 
 
 # ============================================================================
@@ -567,38 +690,158 @@ st.divider()
 # UI — FUNDAMENTAL ANALYSIS
 # ============================================================================
 
-st.header("Fundamental Analysis — Relative Fair Value")
+st.header("Fundamental Analysis — Relative Valuation & Scenarios")
 
-peers = get_sector_peers(profile.get("finnhubIndustry"), ticker_input)
-peer_pe = fetch_peer_pe_ratios(peers, finnhub_key)
-target_eps = (metrics.get("metric") or {}).get("epsTTM")
-sector_avg_pe = (sum(peer_pe.values()) / len(peer_pe)) if peer_pe else None
-fair_value = calculate_fair_value(sector_avg_pe, target_eps)
+# ---- Part 1: peer group + median sector multiples ----
+peers = fetch_peer_group(ticker_input, profile.get("finnhubIndustry"), finnhub_key)
+peer_rows = fetch_peer_metrics(peers, finnhub_key)
+sector = compute_sector_multiples(peer_rows)
+sector_median_pe = sector["median_pe"]
 
-fcol1, fcol2, fcol3 = st.columns(3)
-fcol1.metric("Sector Avg P/E", f"{sector_avg_pe:.2f}" if sector_avg_pe else "N/A")
-fcol2.metric(f"{ticker_input} Trailing EPS", f"${target_eps:.2f}" if target_eps is not None else "N/A")
+# ---- Company fundamentals from Finnhub ----
+trailing_eps = metric_value(metrics, "epsTTM")
+trailing_pe = metric_value(metrics, "peTTM")
+sales_per_share = metric_value(metrics, "salesPerShareTTM", "revenuePerShareTTM")
+hist_avg_pe = get_historical_avg_pe(metrics)
+auto_growth = normalize_growth(
+    metric_value(metrics, "epsGrowth5Y", "epsGrowthTTMYoy", "revenueGrowth5Y", "revenueGrowthTTMYoy")
+)
+is_unprofitable = trailing_eps is not None and trailing_eps < 0
 
-if fair_value:
+# The anchor multiple M (Part 2/3): prefer the stock's own 5-year historical
+# average P/E, else the sector median, else its current trailing P/E.
+default_anchor = hist_avg_pe or sector_median_pe or trailing_pe or 20.0
+anchor_source = (
+    "5-year historical avg P/E" if hist_avg_pe
+    else "sector median P/E" if sector_median_pe
+    else "current trailing P/E" if trailing_pe
+    else "default (20x)"
+)
+default_base_g = auto_growth if auto_growth is not None else 0.10
+default_base_g = max(0.0, min(default_base_g, 0.50))  # clamp the auto-seed to a sane slider range
+
+# ---- Adjustable assumptions (premium consensus data isn't free, so these
+#      auto-seed from available data and remain user-tunable) ----
+with st.expander("⚙️ Valuation assumptions (adjustable)", expanded=False):
+    st.caption(
+        f"Anchor multiple auto-seeded from **{anchor_source}**. "
+        "Forward-looking consensus estimates are premium-only on the free data "
+        "tiers, so these inputs are yours to tune."
+    )
+    # Sliders operate in whole-percent units for clear labels; the math
+    # below converts each back to a decimal fraction (÷100).
+    ac1, ac2 = st.columns(2)
+    with ac1:
+        base_g_pct = st.slider("Base-case EPS growth (g)", 0, 50, int(round(default_base_g * 100)),
+                               1, format="%d%%", key="base_g")
+        bear_g_pct = st.slider("Bear-case EPS growth", 0, 20, 5, 1, format="%d%%", key="bear_g")
+        bull_g_pct = st.slider("Bull-case EPS growth", 0, 60,
+                               int(round(min(default_base_g + 0.10, 0.60) * 100)), 1,
+                               format="%d%%", key="bull_g")
+    with ac2:
+        anchor_m = st.number_input("Anchor multiple (M)", 1.0, 200.0, float(round(default_anchor, 1)),
+                                   0.5, key="anchor_m")
+        bear_comp_pct = st.slider("Bear multiple compression", 0, 50, 25, 5,
+                                  format="%d%%", key="bear_comp")
+        bull_exp_pct = st.slider("Bull multiple expansion", 0, 50, 18, 1,
+                                 format="%d%%", key="bull_exp")
+
+base_g, bear_g, bull_g = base_g_pct / 100, bear_g_pct / 100, bull_g_pct / 100
+bear_compression, bull_expansion = bear_comp_pct / 100, bull_exp_pct / 100
+
+base_m = anchor_m
+bear_m = anchor_m * (1 - bear_compression)
+bull_m = anchor_m * (1 + bull_expansion)
+
+forward_eps = estimate_forward_eps(trailing_eps, base_g)
+forward_pe = (current_price / forward_eps) if forward_eps and forward_eps > 0 else None
+
+# ---- Part 2: historical-multiple fair value (P/S fallback if unprofitable) ----
+if is_unprofitable:
+    fair_value = ps_fair_value(sector["median_ps"], sales_per_share)
+    fair_basis = "Price/Sales model (EPS < 0 — unprofitable)"
+else:
+    fair_value = historical_multiple_fair_value(forward_eps, base_m)
+    fair_basis = f"Forward EPS × anchor multiple ({anchor_source})"
+
+# ---- Headline multiples ----
+f1, f2, f3 = st.columns(3)
+f1.metric("Trailing P/E", f"{trailing_pe:.1f}x" if trailing_pe else "N/A")
+f2.metric("Est. Forward P/E", f"{forward_pe:.1f}x" if forward_pe else "N/A",
+          help="Price ÷ (trailing EPS grown by base-case g). True consensus "
+               "forward P/E is premium-only on the free data tiers.")
+f3.metric(
+    "Sector Median P/E",
+    f"{sector_median_pe:.1f}x" if sector_median_pe else "N/A",
+    f"{sector['count']} peers" if sector["count"] else None,
+    delta_color="off",
+    help="Median (not mean) of cleansed sub-industry peers — resistant to "
+         "mega-cap outliers.",
+)
+
+# ---- Fair value vs current price ----
+if fair_value and fair_value > 0:
     premium_discount = (current_price - fair_value) / fair_value * 100
     label = "Premium" if premium_discount > 0 else "Discount"
-    fcol3.metric(
+    st.metric(
         "Implied Fair Value",
         f"${fair_value:,.2f}",
-        f"{premium_discount:+.1f}% ({label} to Fair Value)",
+        f"{premium_discount:+.1f}% ({label} to fair value)",
         delta_color="inverse",
     )
+    st.caption(f"Basis: {fair_basis}")
 else:
-    fcol3.metric("Implied Fair Value", "N/A")
+    st.metric("Implied Fair Value", "N/A")
+    st.caption(
+        "Fair value unavailable — the underlying data "
+        f"({'sales-per-share / sector P/S' if is_unprofitable else 'EPS / anchor multiple'}) "
+        "wasn't returned for this ticker."
+    )
 
-with st.expander(f"Peer comparison ({', '.join(peers) if peers else 'none found'})"):
-    if peer_pe:
+# ---- Part 3: Bear / Base / Bull scenarios ----
+st.subheader("12-Month Price Targets — Bear / Base / Bull")
+scenarios = [
+    ("🐻 Bear", bear_g, bear_m, scenario_target(trailing_eps, bear_g, bear_m)),
+    ("⚖️ Base", base_g, base_m, scenario_target(trailing_eps, base_g, base_m)),
+    ("🐂 Bull", bull_g, bull_m, scenario_target(trailing_eps, bull_g, bull_m)),
+]
+
+scol = st.columns(3)
+for col, (name, g, m, target) in zip(scol, scenarios):
+    if target and target > 0:
+        upside = (target - current_price) / current_price * 100
+        col.metric(name, f"${target:,.2f}", f"{upside:+.1f}% vs current")
+        col.caption(f"{g * 100:.0f}% growth · {m:.1f}x multiple")
+    else:
+        col.metric(name, "N/A")
+        col.caption("Needs positive trailing EPS")
+
+# Visualize the three targets against the current price.
+targets = {name.split()[-1]: t for name, _, _, t in scenarios if t and t > 0}
+if targets:
+    chart_df = pd.DataFrame(
+        {"Price ($)": {**targets, "Current": current_price}}
+    ).reindex(["Bear", "Current", "Base", "Bull"]).dropna()
+    st.bar_chart(chart_df, color="#4C9BE8")
+
+# ---- Peer detail ----
+with st.expander(f"Peer group ({', '.join(peers) if peers else 'none found'})"):
+    valid_peers = sector["valid_peers"]
+    if valid_peers:
         peer_df = pd.DataFrame(
-            {"Ticker": list(peer_pe.keys()), "Trailing P/E": list(peer_pe.values())}
+            [{"Ticker": r["ticker"], "Trailing P/E": round(r["pe"], 1),
+              "P/S": round(r["ps"], 1) if isinstance(r.get("ps"), (int, float)) else None}
+             for r in valid_peers]
         )
         st.dataframe(peer_df, hide_index=True, use_container_width=True)
+        if sector["mean_pe"] and sector_median_pe:
+            st.caption(
+                f"Median P/E **{sector_median_pe:.1f}x** vs mean **{sector['mean_pe']:.1f}x** — "
+                "the median is used precisely because the mean gets pulled by outliers. "
+                "Negative and >200 P/E peers were filtered out."
+            )
     else:
-        st.write("Peer P/E data unavailable.")
+        st.write("No valid peer P/E data returned.")
 
 st.divider()
 

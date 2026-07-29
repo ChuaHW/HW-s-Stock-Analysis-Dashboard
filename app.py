@@ -1,15 +1,16 @@
 """
 Automated Market Intelligence Dashboard
 ----------------------------------------
-Takes a stock ticker and produces a technical, fundamental, and
-qualitative (LLM-powered) analysis in a single Streamlit view.
+Takes a stock ticker and produces a technical and fundamental analysis
+(valuation multiples, analyst price targets, and a DCF intrinsic value)
+in a single Streamlit view.
 
 Run locally:
     pip install -r requirements.txt
     streamlit run app.py
 
-API keys (three required):
-    1. Finnhub (quotes, fundamentals, news, earnings) — free, no credit
+API keys (two required):
+    1. Finnhub (quotes, fundamentals, peers, earnings) — free, no credit
        card, 60 calls/minute.
        Get a key at: https://finnhub.io/register
        See `get_finnhub_api_key()` below for exactly where to put it.
@@ -26,12 +27,8 @@ API keys (three required):
        - Streamlit Cloud: Advanced settings -> Secrets ->
                                TWELVEDATA_API_KEY = "..."
 
-    3. Google Gemini (LLM narrative) — free tier, no credit card.
-       Get a key at: https://aistudio.google.com/apikey
-       See `get_llm_client()` below for exactly where to put it.
-       - Local dev:      set the GEMINI_API_KEY environment variable
-       - Streamlit Cloud: Advanced settings -> Secrets ->
-                               GEMINI_API_KEY = "AIza..."
+    Analyst price targets use yfinance (Yahoo Finance) — no key required.
+    Finnhub's price-target endpoint is premium, so this is the free source.
 """
 
 import os
@@ -43,8 +40,7 @@ import finnhub
 import pandas as pd
 import requests
 import streamlit as st
-from google import genai
-from google.genai import types as genai_types
+import yfinance as yf
 
 # ============================================================================
 # CONFIG
@@ -55,8 +51,6 @@ st.set_page_config(
     page_icon="📈",
     layout="wide",
 )
-
-LLM_MODEL = "gemini-3.1-flash-lite"
 
 # Industry keyword -> 3-4 comparable peer tickers. Matched via substring
 # search against Finnhub's `finnhubIndustry` classification string (Finnhub
@@ -84,53 +78,9 @@ INDUSTRY_KEYWORD_PEERS = [
 
 DEFAULT_PEERS = ["MSFT", "AAPL", "GOOGL", "AMZN"]
 
-# Fundamental-analysis tuning knobs (see the framework in the README/commit).
+# Fundamental-analysis tuning knobs.
 PEER_LIMIT = 20          # top-N peers by market cap to include in the median
 PE_OUTLIER_MAX = 200.0   # discard P/E above this as an extreme outlier
-HIST_PE_YEARS = 5        # window for the historical-average-P/E anchor multiple
-
-
-# ============================================================================
-# LLM CLIENT (Google Gemini)
-# ============================================================================
-
-
-def get_llm_client():
-    """
-    Returns a google.genai.Client, or None if no key is configured.
-
-    >>> INSERT YOUR API KEY <<<
-    Get a free key (no credit card required) at https://aistudio.google.com/apikey
-    Set it as the environment variable GEMINI_API_KEY, or (on Streamlit
-    Community Cloud) add GEMINI_API_KEY under Advanced Settings -> Secrets.
-    Never hardcode the key directly in this file.
-    """
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        try:
-            api_key = st.secrets["GEMINI_API_KEY"]
-        except Exception:
-            api_key = None
-    if not api_key:
-        return None
-    return genai.Client(api_key=api_key)
-
-
-def call_llm(client, system_prompt: str, user_prompt: str, max_tokens: int = 300) -> str:
-    if client is None:
-        return "LLM analysis unavailable — no GEMINI_API_KEY configured."
-    try:
-        response = client.models.generate_content(
-            model=LLM_MODEL,
-            contents=user_prompt,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                max_output_tokens=max_tokens,
-            ),
-        )
-        return response.text or ""
-    except Exception as e:
-        return f"LLM request failed: {e}"
 
 
 # ============================================================================
@@ -234,7 +184,7 @@ def fetch_price_history(ticker: str, api_key: str) -> pd.DataFrame:
 # but caching still avoids redundant work on repeat page loads.
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_ticker_data(ticker: str, api_key: str):
-    """Pulls quote/fundamentals/news/earnings from Finnhub in one cached call."""
+    """Pulls quote/profile/fundamentals/earnings from Finnhub in one cached call."""
     client = finnhub.Client(api_key=api_key)
 
     def _load_core():
@@ -254,18 +204,6 @@ def fetch_ticker_data(ticker: str, api_key: str):
 
     end = datetime.now()
     try:
-        news = (
-            client.company_news(
-                ticker,
-                _from=(end - timedelta(days=30)).strftime("%Y-%m-%d"),
-                to=end.strftime("%Y-%m-%d"),
-            )
-            or []
-        )
-    except Exception:
-        news = []
-
-    try:
         metrics = client.company_basic_financials(ticker, "all") or {}
     except Exception:
         metrics = {}
@@ -282,7 +220,7 @@ def fetch_ticker_data(ticker: str, api_key: str):
     except Exception:
         earnings = {}
 
-    return profile, quote, news, metrics, earnings
+    return profile, quote, metrics, earnings
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -333,6 +271,43 @@ def fetch_peer_metrics(peers: list, api_key: str) -> list:
     return rows
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_analyst_targets(ticker: str, finnhub_key: str) -> dict:
+    """
+    Analyst price-target consensus (low / mean / high). Tries Finnhub first
+    (in case the plan includes it), then falls back to yfinance's free
+    `.info` fields. Returns None if neither source has targets.
+    """
+    # Finnhub /stock/price-target — premium on most plans, but try anyway.
+    try:
+        client = finnhub.Client(api_key=finnhub_key)
+        pt = _with_retry(lambda: client.price_target(ticker), retries=1, base_delay=1.0) or {}
+        if pt.get("targetMean"):
+            return {
+                "low": pt.get("targetLow"),
+                "mean": pt.get("targetMean"),
+                "high": pt.get("targetHigh"),
+                "count": None,
+                "source": "Finnhub",
+            }
+    except Exception:
+        pass
+    # yfinance free fallback (Yahoo Finance).
+    try:
+        info = _with_retry(lambda: yf.Ticker(ticker).info, retries=2, base_delay=1.5) or {}
+        if info.get("targetMeanPrice"):
+            return {
+                "low": info.get("targetLowPrice"),
+                "mean": info.get("targetMeanPrice"),
+                "high": info.get("targetHighPrice"),
+                "count": info.get("numberOfAnalystOpinions"),
+                "source": "Yahoo Finance",
+            }
+    except Exception:
+        pass
+    return None
+
+
 def get_next_earnings_date(earnings: dict) -> str:
     try:
         calendar_entries = earnings.get("earningsCalendar") or []
@@ -340,36 +315,6 @@ def get_next_earnings_date(earnings: dict) -> str:
         return dates[0] if dates else "N/A"
     except Exception:
         return "N/A"
-
-
-# ============================================================================
-# NEWS HELPERS
-# ============================================================================
-
-
-def get_news_title(item: dict) -> str:
-    return item.get("headline", "")
-
-
-def get_news_publisher(item: dict) -> str:
-    return item.get("source", "")
-
-
-def get_news_datetime(item: dict):
-    ts = item.get("datetime")
-    if isinstance(ts, (int, float)) and ts > 0:
-        return datetime.fromtimestamp(ts)
-    return None
-
-
-def format_headlines(news_items: list) -> str:
-    lines = []
-    for item in news_items[:5]:
-        title = get_news_title(item)
-        publisher = get_news_publisher(item)
-        if title:
-            lines.append(f"- {title} ({publisher})" if publisher else f"- {title}")
-    return "\n".join(lines) if lines else "No headlines available."
 
 
 # ============================================================================
@@ -462,113 +407,39 @@ def compute_sector_multiples(peer_rows: list) -> dict:
     }
 
 
-def get_historical_avg_pe(metrics: dict, years: int = HIST_PE_YEARS):
+def peg_ratio(pe, growth_pct):
+    """PEG = P/E ÷ annual earnings growth (in whole percent). Under 1.0 is the
+    classic 'cheap relative to growth' threshold for growth stocks."""
+    if not pe or pe <= 0 or not growth_pct or growth_pct <= 0:
+        return None
+    return pe / growth_pct
+
+
+def dcf_intrinsic_value(base_fcf_ps, growth, discount_rate, terminal_growth, years):
     """
-    5-year average trailing P/E from Finnhub's annual `series` (the anchor
-    multiple M_historical in Part 2). Returns None when the series isn't
-    available for this ticker/tier.
+    Two-stage DCF on a per-share basis (the practical form of
+    Intrinsic Value = Σ FCF_t / (1 + r)^t): project free cash flow per share
+    for `years` at `growth`, discount each year at `discount_rate` (WACC),
+    add a Gordon-growth terminal value, and sum the present values.
+
+        intrinsic = Σ_{t=1..N} FCF_t/(1+r)^t  +  TV/(1+r)^N
+        where TV = FCF_N·(1+g_term) / (r − g_term)
+
+    Per-share, no net-debt adjustment (a deliberate simplification).
+    Returns None if inputs are unusable.
     """
-    try:
-        annual = ((metrics or {}).get("series") or {}).get("annual") or {}
-        pe_series = annual.get("pe") or []
-        values = [
-            pt.get("v")
-            for pt in pe_series
-            if isinstance(pt.get("v"), (int, float)) and 0 < pt["v"] <= PE_OUTLIER_MAX
-        ]
-        values = values[:years]  # Finnhub returns the series newest-first
-        return statistics.fmean(values) if values else None
-    except Exception:
+    if not base_fcf_ps or base_fcf_ps <= 0:
         return None
-
-
-def estimate_forward_eps(eps_ttm, growth):
-    """NTM EPS proxy: trailing EPS grown one year (true consensus NTM EPS is
-    premium-only, so this is derived from EPS_ttm and the growth assumption)."""
-    if eps_ttm is None or growth is None:
-        return None
-    return eps_ttm * (1 + growth)
-
-
-def historical_multiple_fair_value(eps_fwd, m_historical):
-    """Part 2 — P_fair = EPS_fwd × M_historical."""
-    if eps_fwd is None or m_historical is None:
-        return None
-    return eps_fwd * m_historical
-
-
-def ps_fair_value(sector_median_ps, sales_per_share):
-    """Unprofitable-company fallback (EPS < 0): value on Price/Sales instead."""
-    if not sector_median_ps or not sales_per_share:
-        return None
-    return sector_median_ps * sales_per_share
-
-
-def scenario_target(eps_ttm, growth, multiple, t: int = 1):
-    """Part 3 — P_target = EPS_ttm × (1 + g)^t × M_target."""
-    if eps_ttm is None or multiple is None or growth is None:
-        return None
-    return eps_ttm * ((1 + growth) ** t) * multiple
-
-
-# ============================================================================
-# QUALITATIVE ANALYSIS
-# ============================================================================
-
-
-def find_largest_move_date(hist: pd.DataFrame, lookback_days: int = 30):
-    recent = hist.tail(lookback_days).copy()
-    if len(recent) < 2:
-        return None, None
-    recent["pct_change"] = recent["Close"].pct_change() * 100
-    recent = recent.dropna(subset=["pct_change"])
-    if recent.empty:
-        return None, None
-    idx = recent["pct_change"].abs().idxmax()
-    return idx.date(), recent.loc[idx, "pct_change"]
-
-
-def get_news_for_date(news: list, target_date) -> list:
-    matched = []
-    for item in news:
-        dt = get_news_datetime(item)
-        if dt and dt.date() == target_date:
-            matched.append(item)
-    return matched
-
-
-def get_recent_news(news: list, hours: int = 48) -> list:
-    cutoff = datetime.now() - timedelta(hours=hours)
-    recent = []
-    for item in news:
-        dt = get_news_datetime(item)
-        if dt and dt >= cutoff:
-            recent.append(item)
-    return recent
-
-
-def get_catalyst_analysis(client, ticker, move_date, pct_change, news_items) -> str:
-    headlines = format_headlines(news_items)
-    prompt = (
-        f"Stock: {ticker}\n"
-        f"Date of move: {move_date}\n"
-        f"Price change: {pct_change:.2f}%\n\n"
-        f"Headlines from that date:\n{headlines}\n\n"
-        "Explain in 2 sentences exactly why this stock moved significantly "
-        "on this date based on these headlines."
-    )
-    return call_llm(client, "You are a concise financial analyst.", prompt, max_tokens=200)
-
-
-def get_current_narrative(client, ticker, news_items) -> str:
-    headlines = format_headlines(news_items)
-    prompt = (
-        f"Stock: {ticker}\n\n"
-        f"Headlines from the last 48 hours:\n{headlines}\n\n"
-        "Synthesize the current market sentiment and narrative for this "
-        "stock into a tight, 3-sentence summary."
-    )
-    return call_llm(client, "You are a concise financial analyst.", prompt, max_tokens=250)
+    if discount_rate <= terminal_growth:
+        return None  # terminal value diverges when r <= g_terminal
+    pv_sum = 0.0
+    fcf = base_fcf_ps
+    for t in range(1, years + 1):
+        fcf = base_fcf_ps * ((1 + growth) ** t)
+        pv_sum += fcf / ((1 + discount_rate) ** t)
+    terminal_value = fcf * (1 + terminal_growth) / (discount_rate - terminal_growth)
+    pv_sum += terminal_value / ((1 + discount_rate) ** years)
+    return pv_sum
 
 
 # ============================================================================
@@ -578,7 +449,7 @@ def get_current_narrative(client, ticker, news_items) -> str:
 st.sidebar.title("Market Intelligence")
 ticker_input = st.sidebar.text_input("Enter Stock Ticker", value="NVDA").upper().strip()
 st.sidebar.button("Analyze", type="primary", use_container_width=True)
-st.sidebar.caption("Data: Finnhub + Twelve Data. Narrative: Google Gemini API.")
+st.sidebar.caption("Data: Finnhub · Twelve Data · Yahoo Finance (analyst targets).")
 
 st.title("📈 Automated Market Intelligence Dashboard")
 
@@ -603,7 +474,7 @@ if missing_keys:
 
 with st.spinner(f"Fetching data for {ticker_input}..."):
     try:
-        profile, quote, news, metrics, earnings = fetch_ticker_data(ticker_input, finnhub_key)
+        profile, quote, metrics, earnings = fetch_ticker_data(ticker_input, finnhub_key)
         hist = fetch_price_history(ticker_input, twelvedata_key)
     except Exception as e:
         st.error(f"Could not fetch data for '{ticker_input}': {e}")
@@ -690,139 +561,122 @@ st.divider()
 # UI — FUNDAMENTAL ANALYSIS
 # ============================================================================
 
-st.header("Fundamental Analysis — Relative Valuation & Scenarios")
+st.header("Fundamental Analysis — Valuation")
 
-# ---- Part 1: peer group + median sector multiples ----
+# ---- Peer group + outlier-resistant median sector P/E ----
 peers = fetch_peer_group(ticker_input, profile.get("finnhubIndustry"), finnhub_key)
 peer_rows = fetch_peer_metrics(peers, finnhub_key)
 sector = compute_sector_multiples(peer_rows)
 sector_median_pe = sector["median_pe"]
 
 # ---- Company fundamentals from Finnhub ----
-trailing_eps = metric_value(metrics, "epsTTM")
 trailing_pe = metric_value(metrics, "peTTM")
-sales_per_share = metric_value(metrics, "salesPerShareTTM", "revenuePerShareTTM")
-hist_avg_pe = get_historical_avg_pe(metrics)
+fcf_per_share = metric_value(
+    metrics, "freeCashFlowPerShareTTM", "freeCashFlowPerShareAnnual", "cashFlowPerShareTTM"
+)
 auto_growth = normalize_growth(
-    metric_value(metrics, "epsGrowth5Y", "epsGrowthTTMYoy", "revenueGrowth5Y", "revenueGrowthTTMYoy")
+    metric_value(metrics, "epsGrowth5Y", "epsGrowth3Y", "epsGrowthTTMYoy", "revenueGrowth5Y")
 )
-is_unprofitable = trailing_eps is not None and trailing_eps < 0
+default_growth_pct = max(1, min(int(round((auto_growth if auto_growth is not None else 0.10) * 100)), 60))
 
-# The anchor multiple M (Part 2/3): prefer the stock's own 5-year historical
-# average P/E, else the sector median, else its current trailing P/E.
-default_anchor = hist_avg_pe or sector_median_pe or trailing_pe or 20.0
-anchor_source = (
-    "5-year historical avg P/E" if hist_avg_pe
-    else "sector median P/E" if sector_median_pe
-    else "current trailing P/E" if trailing_pe
-    else "default (20x)"
-)
-default_base_g = auto_growth if auto_growth is not None else 0.10
-default_base_g = max(0.0, min(default_base_g, 0.50))  # clamp the auto-seed to a sane slider range
-
-# ---- Adjustable assumptions (premium consensus data isn't free, so these
-#      auto-seed from available data and remain user-tunable) ----
+# ---- Adjustable assumptions (auto-seeded where free data allows) ----
 with st.expander("⚙️ Valuation assumptions (adjustable)", expanded=False):
     st.caption(
-        f"Anchor multiple auto-seeded from **{anchor_source}**. "
-        "Forward-looking consensus estimates are premium-only on the free data "
-        "tiers, so these inputs are yours to tune."
+        "Growth and DCF inputs auto-seed from available data where possible "
+        "(analyst consensus estimates are premium-only on the free tiers), and "
+        "are yours to tune."
     )
-    # Sliders operate in whole-percent units for clear labels; the math
-    # below converts each back to a decimal fraction (÷100).
     ac1, ac2 = st.columns(2)
     with ac1:
-        base_g_pct = st.slider("Base-case EPS growth (g)", 0, 50, int(round(default_base_g * 100)),
-                               1, format="%d%%", key="base_g")
-        bear_g_pct = st.slider("Bear-case EPS growth", 0, 20, 5, 1, format="%d%%", key="bear_g")
-        bull_g_pct = st.slider("Bull-case EPS growth", 0, 60,
-                               int(round(min(default_base_g + 0.10, 0.60) * 100)), 1,
-                               format="%d%%", key="bull_g")
+        growth_pct = st.slider("Expected annual EPS growth (for PEG)", 1, 60, default_growth_pct, 1,
+                               format="%d%%", key="peg_growth")
+        dcf_g_pct = st.slider("DCF · FCF growth (stage 1)", 0, 30, min(default_growth_pct, 30), 1,
+                              format="%d%%", key="dcf_g")
+        dcf_years = st.slider("DCF · projection years", 5, 15, 10, 1, key="dcf_years")
     with ac2:
-        anchor_m = st.number_input("Anchor multiple (M)", 1.0, 200.0, float(round(default_anchor, 1)),
-                                   0.5, key="anchor_m")
-        bear_comp_pct = st.slider("Bear multiple compression", 0, 50, 25, 5,
-                                  format="%d%%", key="bear_comp")
-        bull_exp_pct = st.slider("Bull multiple expansion", 0, 50, 18, 1,
-                                 format="%d%%", key="bull_exp")
+        dcf_base_fcf = st.number_input(
+            "DCF · base FCF per share ($)",
+            value=float(round(fcf_per_share, 2)) if isinstance(fcf_per_share, (int, float)) else 0.0,
+            step=0.10, key="dcf_fcf",
+            help="Auto-seeded from Finnhub when available; adjust to your own estimate.",
+        )
+        dcf_r_pct = st.slider("DCF · discount rate (WACC)", 4, 15, 9, 1, format="%d%%", key="dcf_r")
+        dcf_tg_pct = st.slider("DCF · terminal growth", 0, 5, 3, 1, format="%d%%", key="dcf_tg")
 
-base_g, bear_g, bull_g = base_g_pct / 100, bear_g_pct / 100, bull_g_pct / 100
-bear_compression, bull_expansion = bear_comp_pct / 100, bull_exp_pct / 100
-
-base_m = anchor_m
-bear_m = anchor_m * (1 - bear_compression)
-bull_m = anchor_m * (1 + bull_expansion)
-
-forward_eps = estimate_forward_eps(trailing_eps, base_g)
-forward_pe = (current_price / forward_eps) if forward_eps and forward_eps > 0 else None
-
-# ---- Part 2: historical-multiple fair value (P/S fallback if unprofitable) ----
-if is_unprofitable:
-    fair_value = ps_fair_value(sector["median_ps"], sales_per_share)
-    fair_basis = "Price/Sales model (EPS < 0 — unprofitable)"
+# ---- Valuation multiples: P/E, PEG, Sector Median P/E ----
+peg = peg_ratio(trailing_pe, growth_pct)
+m1, m2, m3 = st.columns(3)
+m1.metric(
+    "P/E Ratio (trailing)", f"{trailing_pe:.1f}x" if trailing_pe else "N/A",
+    help="Price ÷ EPS — what you pay per $1 of trailing profit. A lower P/E can "
+         "signal undervaluation; a higher one reflects strong growth expectations.",
+)
+if peg is not None:
+    m2.metric(
+        "PEG Ratio", f"{peg:.2f}",
+        "Below 1.0 — cheap vs growth" if peg < 1 else "Above 1.0 — rich vs growth",
+        delta_color="off",
+        help=f"P/E ÷ growth ({growth_pct}%). Under 1.0 is the classic bargain "
+             "threshold relative to a growth stock's earnings growth.",
+    )
 else:
-    fair_value = historical_multiple_fair_value(forward_eps, base_m)
-    fair_basis = f"Forward EPS × anchor multiple ({anchor_source})"
-
-# ---- Headline multiples ----
-f1, f2, f3 = st.columns(3)
-f1.metric("Trailing P/E", f"{trailing_pe:.1f}x" if trailing_pe else "N/A")
-f2.metric("Est. Forward P/E", f"{forward_pe:.1f}x" if forward_pe else "N/A",
-          help="Price ÷ (trailing EPS grown by base-case g). True consensus "
-               "forward P/E is premium-only on the free data tiers.")
-f3.metric(
-    "Sector Median P/E",
-    f"{sector_median_pe:.1f}x" if sector_median_pe else "N/A",
-    f"{sector['count']} peers" if sector["count"] else None,
-    delta_color="off",
-    help="Median (not mean) of cleansed sub-industry peers — resistant to "
-         "mega-cap outliers.",
+    m2.metric("PEG Ratio", "N/A", help="Needs a positive P/E and a positive growth rate.")
+m3.metric(
+    "Sector Median P/E", f"{sector_median_pe:.1f}x" if sector_median_pe else "N/A",
+    f"{sector['count']} peers" if sector["count"] else None, delta_color="off",
+    help="Median (not mean) of cleansed sub-industry peers — resistant to mega-cap outliers.",
 )
 
-# ---- Fair value vs current price ----
-if fair_value and fair_value > 0:
-    premium_discount = (current_price - fair_value) / fair_value * 100
-    label = "Premium" if premium_discount > 0 else "Discount"
-    st.metric(
-        "Implied Fair Value",
-        f"${fair_value:,.2f}",
-        f"{premium_discount:+.1f}% ({label} to fair value)",
-        delta_color="inverse",
-    )
-    st.caption(f"Basis: {fair_basis}")
-else:
-    st.metric("Implied Fair Value", "N/A")
-    st.caption(
-        "Fair value unavailable — the underlying data "
-        f"({'sales-per-share / sector P/S' if is_unprofitable else 'EPS / anchor multiple'}) "
-        "wasn't returned for this ticker."
-    )
+# ---- Analyst price targets: MIN / AVG / MAX ----
+st.subheader("Analyst Price Targets (next 12 months)")
+targets = fetch_analyst_targets(ticker_input, finnhub_key)
+if targets and isinstance(targets.get("mean"), (int, float)):
+    tcols = st.columns(3)
+    for col, key, label in zip(tcols, ["low", "mean", "high"], ["Min", "Avg", "Max"]):
+        val = targets.get(key)
+        if isinstance(val, (int, float)) and val > 0:
+            upside = (val - current_price) / current_price * 100
+            col.metric(f"{label} Target", f"${val:,.2f}", f"{upside:+.1f}% vs current")
+        else:
+            col.metric(f"{label} Target", "N/A")
+    n = targets.get("count")
+    st.caption(f"Source: {targets.get('source')}" + (f" · {n} analysts" if n else ""))
 
-# ---- Part 3: Bear / Base / Bull scenarios ----
-st.subheader("12-Month Price Targets — Bear / Base / Bull")
-scenarios = [
-    ("🐻 Bear", bear_g, bear_m, scenario_target(trailing_eps, bear_g, bear_m)),
-    ("⚖️ Base", base_g, base_m, scenario_target(trailing_eps, base_g, base_m)),
-    ("🐂 Bull", bull_g, bull_m, scenario_target(trailing_eps, bull_g, bull_m)),
-]
-
-scol = st.columns(3)
-for col, (name, g, m, target) in zip(scol, scenarios):
-    if target and target > 0:
-        upside = (target - current_price) / current_price * 100
-        col.metric(name, f"${target:,.2f}", f"{upside:+.1f}% vs current")
-        col.caption(f"{g * 100:.0f}% growth · {m:.1f}x multiple")
-    else:
-        col.metric(name, "N/A")
-        col.caption("Needs positive trailing EPS")
-
-# Visualize the three targets against the current price.
-targets = {name.split()[-1]: t for name, _, _, t in scenarios if t and t > 0}
-if targets:
     chart_df = pd.DataFrame(
-        {"Price ($)": {**targets, "Current": current_price}}
-    ).reindex(["Bear", "Current", "Base", "Bull"]).dropna()
-    st.bar_chart(chart_df, color="#4C9BE8")
+        {"Price ($)": {
+            "Min": targets.get("low"), "Current": current_price,
+            "Avg": targets.get("mean"), "Max": targets.get("high"),
+        }}
+    )
+    chart_df = chart_df[chart_df["Price ($)"].apply(lambda v: isinstance(v, (int, float)) and v > 0)]
+    if not chart_df.empty:
+        st.bar_chart(chart_df, color="#4C9BE8")
+else:
+    st.info(
+        "No analyst price targets available for this ticker. Finnhub's price-target "
+        "endpoint is premium, and the Yahoo Finance fallback returned none (it may be "
+        "rate-limited or the ticker isn't covered)."
+    )
+
+# ---- Intrinsic value: Discounted Cash Flow ----
+st.subheader("Intrinsic Value — Discounted Cash Flow (DCF)")
+intrinsic = dcf_intrinsic_value(dcf_base_fcf, dcf_g_pct / 100, dcf_r_pct / 100, dcf_tg_pct / 100, dcf_years)
+if intrinsic and intrinsic > 0:
+    gap = (intrinsic - current_price) / current_price * 100
+    verdict = "Undervalued" if intrinsic > current_price else "Overvalued"
+    st.metric("DCF Intrinsic Value / share", f"${intrinsic:,.2f}",
+              f"{gap:+.1f}% vs price ({verdict})")
+    st.caption(
+        f"2-stage DCF: {dcf_years}y at {dcf_g_pct}% FCF growth, {dcf_r_pct}% discount "
+        f"(WACC), {dcf_tg_pct}% terminal growth, base FCF/share ${dcf_base_fcf:.2f}. "
+        "Per-share, no net-debt adjustment (simplified)."
+    )
+else:
+    st.metric("DCF Intrinsic Value / share", "N/A")
+    if dcf_r_pct <= dcf_tg_pct:
+        st.caption("Discount rate must exceed terminal growth for the model to converge.")
+    else:
+        st.caption("Set a positive base FCF per share in the assumptions above to run the DCF.")
 
 # ---- Peer detail ----
 with st.expander(f"Peer group ({', '.join(peers) if peers else 'none found'})"):
@@ -844,41 +698,4 @@ with st.expander(f"Peer group ({', '.join(peers) if peers else 'none found'})"):
         st.write("No valid peer P/E data returned.")
 
 st.divider()
-
-# ============================================================================
-# UI — QUALITATIVE ANALYSIS (LLM)
-# ============================================================================
-
-st.header("Market Narrative — Catalysts & Sentiment")
-
-client = get_llm_client()
-if client is None:
-    st.warning(
-        "No LLM API key detected. Set GEMINI_API_KEY as an environment "
-        "variable or Streamlit secret to enable catalyst and narrative analysis. "
-        "Get a free key at https://aistudio.google.com/apikey"
-    )
-
-move_date, move_pct = find_largest_move_date(hist, lookback_days=30)
-
-with st.expander("📰 Catalyst: Largest Price Move (Last 30 Days)", expanded=True):
-    if move_date is not None:
-        st.write(f"**{move_date}** — Price moved **{move_pct:+.2f}%**")
-        move_news = get_news_for_date(news, move_date)
-        with st.spinner("Analyzing catalyst..."):
-            catalyst_text = get_catalyst_analysis(client, ticker_input, move_date, move_pct, move_news)
-        st.write(catalyst_text)
-    else:
-        st.write("Not enough data to identify a significant move.")
-
-with st.expander("🗞️ Current Market Narrative (Last 48 Hours)", expanded=True):
-    recent_news = get_recent_news(news, hours=48)
-    with st.spinner("Synthesizing narrative..."):
-        narrative_text = get_current_narrative(client, ticker_input, recent_news)
-    st.write(narrative_text)
-    if recent_news:
-        st.caption("Source headlines:")
-        st.markdown(format_headlines(recent_news))
-
-st.divider()
-st.caption("Data provided by Finnhub and Twelve Data. Not investment advice.")
+st.caption("Data: Finnhub, Twelve Data, and Yahoo Finance. Not investment advice.")

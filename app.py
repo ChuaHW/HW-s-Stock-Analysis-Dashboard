@@ -43,24 +43,29 @@ import yfinance as yf
 
 st.set_page_config(page_title="Market Intelligence Dashboard", page_icon="📈", layout="wide")
 
-# Palette borrowed from the reference layout: warm cream background, near-black
-# text, terracotta accent, bold Inter headings.
+# Dark palette: black background, light text, terracotta accent, bold Inter
+# headings. Card/panel surfaces sit slightly above pure black.
 ACCENT = "#E8722C"
-INK = "#1C1A17"
-MUTED = "#6B6459"
-SUPPORT_GREEN = "#2E9E6B"
-RESIST_RED = "#D1503C"
-CALL_PURPLE = "#8E44AD"
-PUT_BLUE = "#2980B9"
+INK = "#F5F3EF"          # primary (light) text on black
+MUTED = "#9A9186"        # secondary text, readable on black
+CARD_BG = "#141414"      # metric card / panel surface
+CARD_BORDER = "#2A2A2A"
+CHART_BG = "#0A0A0A"     # chart plot area
+GRID = "#242424"
+SUPPORT_GREEN = "#37C978"
+RESIST_RED = "#F0603C"
+CALL_PURPLE = "#B26BE0"
+PUT_BLUE = "#3FA3F0"
 
 st.markdown(
     f"""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;800&display=swap');
+    .stApp {{ background: #000000; }}
     html, body, [class*="css"], .stMarkdown, .stMetric {{ font-family: 'Inter', sans-serif; }}
     h1, h2, h3 {{ font-weight: 800 !important; color: {INK}; letter-spacing: -0.02em; }}
     [data-testid="stMetric"] {{
-        background: #FFFFFF; border: 1px solid #ECE6DC; border-radius: 14px;
+        background: {CARD_BG}; border: 1px solid {CARD_BORDER}; border-radius: 14px;
         padding: 14px 18px;
     }}
     [data-testid="stMetricValue"] {{ color: {ACCENT}; font-weight: 800; }}
@@ -343,12 +348,12 @@ def build_candlestick(hist: pd.DataFrame, sma, pivots, walls, current_price):
         height=520,
         margin=dict(l=10, r=10, t=30, b=10),
         paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#FFFFFF",
+        plot_bgcolor=CHART_BG,
         font=dict(family="Inter, sans-serif", color=INK),
         xaxis_rangeslider_visible=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        xaxis=dict(gridcolor="#F0EBE2"),
-        yaxis=dict(gridcolor="#F0EBE2"),
+        xaxis=dict(gridcolor=GRID),
+        yaxis=dict(gridcolor=GRID),
     )
     return fig
 

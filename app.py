@@ -46,7 +46,7 @@ st.set_page_config(page_title="Market Intelligence Dashboard", page_icon="📈",
 
 # Dark palette: black background, light text, terracotta accent, bold Inter
 # headings. Card/panel surfaces sit slightly above pure black.
-ACCENT = "#E8722C"
+ACCENT = "#FFFFFF"       # accent: white (metric values, SMA line, target bars)
 INK = "#F5F3EF"          # primary (light) text on black
 MUTED = "#9A9186"        # secondary text, readable on black
 CARD_BG = "#141414"      # metric card / panel surface

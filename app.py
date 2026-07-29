@@ -27,6 +27,7 @@ API keys:
 """
 
 import os
+import statistics
 import time
 from datetime import datetime, timedelta
 
@@ -82,6 +83,33 @@ st.markdown(
 )
 
 
+# Peer groups for the sector-average P/E. Matched by substring against
+# Finnhub's `finnhubIndustry` string when the dynamic /stock/peers call
+# returns nothing.
+INDUSTRY_KEYWORD_PEERS = [
+    (["semiconductor"], ["AMD", "INTC", "QCOM", "TXN"]),
+    (["bank"], ["JPM", "BAC", "C", "WFC"]),
+    (["software"], ["MSFT", "ORCL", "CRM", "ADBE"]),
+    (["internet", "e-commerce", "ecommerce"], ["AMZN", "EBAY", "ETSY", "SHOP"]),
+    (["media", "entertainment"], ["GOOGL", "META", "NFLX", "DIS"]),
+    (["auto", "vehicle"], ["TSLA", "GM", "F", "TM"]),
+    (["oil", "gas", "energy"], ["XOM", "CVX", "COP", "SLB"]),
+    (["pharma", "biotech", "drug"], ["PFE", "MRK", "JNJ", "ABBV"]),
+    (["insurance"], ["UNH", "CI", "ELV", "HUM"]),
+    (["airline"], ["DAL", "UAL", "AAL", "LUV"]),
+    (["aerospace", "defense"], ["BA", "LMT", "RTX", "NOC"]),
+    (["telecom"], ["T", "VZ", "TMUS", "CMCSA"]),
+    (["hardware", "electronics", "computer"], ["AAPL", "MSFT", "GOOGL", "HPQ"]),
+    (["retail"], ["WMT", "TGT", "COST", "HD"]),
+    (["real estate", "reit"], ["PLD", "AMT", "EQIX", "SPG"]),
+    (["utilit"], ["NEE", "DUK", "SO", "D"]),
+    (["metal", "mining", "material"], ["LIN", "SHW", "FCX", "NEM"]),
+]
+DEFAULT_PEERS = ["MSFT", "AAPL", "GOOGL", "AMZN"]
+PEER_LIMIT = 20          # top-N peers by market cap for the median
+PE_OUTLIER_MAX = 200.0   # discard P/E above this as an extreme outlier
+
+
 # ============================================================================
 # API KEYS
 # ============================================================================
@@ -118,7 +146,7 @@ def _with_retry(func, retries: int = 3, base_delay: float = 2.0):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_core(ticker: str, api_key: str):
-    """Quote, company profile, and next earnings date from Finnhub."""
+    """Quote, profile, fundamentals (P/E, EPS), and next earnings from Finnhub."""
     client = finnhub.Client(api_key=api_key)
 
     def _load():
@@ -130,6 +158,11 @@ def fetch_core(ticker: str, api_key: str):
 
     # Propagate so the real error surfaces and a failed call isn't cached.
     profile, quote = _with_retry(_load)
+
+    try:
+        metrics = client.company_basic_financials(ticker, "all") or {}
+    except Exception:
+        metrics = {}
 
     end = datetime.now()
     try:
@@ -143,7 +176,7 @@ def fetch_core(ticker: str, api_key: str):
         )
     except Exception:
         earnings = {}
-    return profile, quote, earnings
+    return profile, quote, metrics, earnings
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -263,6 +296,88 @@ def get_next_earnings_date(earnings: dict) -> str:
         return dates[0] if dates else "N/A"
     except Exception:
         return "N/A"
+
+
+# ============================================================================
+# FUNDAMENTALS (P/E, EPS, sector-average P/E, fair value)
+# ============================================================================
+
+
+def metric_value(metrics: dict, *names):
+    """First present numeric value among candidate Finnhub metric keys."""
+    m = (metrics or {}).get("metric") or {}
+    for n in names:
+        v = m.get(n)
+        if isinstance(v, (int, float)):
+            return v
+    return None
+
+
+def get_sector_peers_static(industry: str, exclude_ticker: str) -> list:
+    """Fallback peer group when Finnhub's /stock/peers returns nothing."""
+    industry_lower = (industry or "").lower()
+    for keywords, peers in INDUSTRY_KEYWORD_PEERS:
+        if any(kw in industry_lower for kw in keywords):
+            return [p for p in peers if p.upper() != exclude_ticker.upper()]
+    return [p for p in DEFAULT_PEERS if p.upper() != exclude_ticker.upper()]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_peer_group(ticker: str, industry: str, api_key: str) -> list:
+    """Sub-industry peer group from Finnhub /stock/peers, with a static fallback."""
+    client = finnhub.Client(api_key=api_key)
+    try:
+        peers = _with_retry(lambda: client.company_peers(ticker), retries=2, base_delay=1.5) or []
+    except Exception:
+        peers = []
+    peers = [p for p in peers if p and p.upper() != ticker.upper()]
+    if not peers:
+        peers = get_sector_peers_static(industry, ticker)
+    return peers[:PEER_LIMIT]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_peer_pes(peers: list, api_key: str) -> list:
+    """Per-peer trailing P/E and market cap for the sector-average calc."""
+    client = finnhub.Client(api_key=api_key)
+    rows = []
+    for peer in peers:
+        try:
+            data = _with_retry(
+                lambda p=peer: client.company_basic_financials(p, "all"), retries=2, base_delay=1.5
+            )
+            metric = data.get("metric") or {}
+            rows.append({"ticker": peer, "pe": metric.get("peTTM"),
+                         "market_cap": metric.get("marketCapitalization")})
+        except Exception:
+            continue
+    return rows
+
+
+def compute_sector_pe(peer_rows: list) -> dict:
+    """
+    Sector-average P/E via the MEDIAN of cleansed peers (a plain mean gets
+    skewed by mega-cap outliers), after dropping negative/zero P/E and P/E
+    above the outlier cap, keeping the top-N by market cap.
+    """
+    valid = [r for r in peer_rows
+             if isinstance(r.get("pe"), (int, float)) and 0 < r["pe"] <= PE_OUTLIER_MAX]
+    if any(r.get("market_cap") for r in valid):
+        valid = sorted(valid, key=lambda r: r.get("market_cap") or 0, reverse=True)[:PEER_LIMIT]
+    pes = [r["pe"] for r in valid]
+    return {
+        "median_pe": statistics.median(pes) if pes else None,
+        "mean_pe": statistics.fmean(pes) if pes else None,
+        "valid_peers": valid,
+        "count": len(pes),
+    }
+
+
+def fair_value_from_sector_pe(sector_pe, eps):
+    """Relative fair value = sector-average P/E × company EPS."""
+    if not sector_pe or eps is None:
+        return None
+    return sector_pe * eps
 
 
 # ============================================================================
@@ -390,7 +505,7 @@ if missing:
 
 with st.spinner(f"Fetching data for {ticker_input}..."):
     try:
-        profile, quote, earnings = fetch_core(ticker_input, finnhub_key)
+        profile, quote, metrics, earnings = fetch_core(ticker_input, finnhub_key)
         hist = fetch_price_history(ticker_input, twelvedata_key)
     except Exception as e:
         st.error(f"Could not fetch data for '{ticker_input}': {e}")
@@ -497,6 +612,62 @@ else:
         lean = "put-heavy (bearish)" if pcr > 1 else "call-heavy (bullish)"
         o3.metric("Put/Call OI Ratio", f"{pcr:.2f}", lean, delta_color="off")
         o3.caption(f"Expiry {selected_expiry}.")
+
+st.divider()
+
+# ============================================================================
+# UI — FUNDAMENTALS (P/E, EPS, sector-average P/E, fair value)
+# ============================================================================
+
+st.header("Fundamentals — Relative Fair Value")
+
+trailing_pe = metric_value(metrics, "peTTM")
+trailing_eps = metric_value(metrics, "epsTTM")
+peers = fetch_peer_group(ticker_input, profile.get("finnhubIndustry"), finnhub_key)
+sector = compute_sector_pe(fetch_peer_pes(peers, finnhub_key))
+sector_pe = sector["median_pe"]
+fair_value = fair_value_from_sector_pe(sector_pe, trailing_eps)
+
+fcol1, fcol2, fcol3 = st.columns(3)
+fcol1.metric("P/E Ratio (trailing)", f"{trailing_pe:.1f}x" if trailing_pe else "N/A",
+             help="Price ÷ EPS — what you pay per $1 of trailing profit.")
+fcol2.metric("EPS (trailing, TTM)", f"${trailing_eps:,.2f}" if trailing_eps is not None else "N/A",
+             help="Earnings per share over the trailing twelve months.")
+fcol3.metric("Sector Avg P/E", f"{sector_pe:.1f}x" if sector_pe else "N/A",
+             f"{sector['count']} peers" if sector["count"] else None, delta_color="off",
+             help="Median (not mean) of cleansed sub-industry peers — resistant to outliers.")
+
+if fair_value and fair_value > 0:
+    premium_discount = (current_price - fair_value) / fair_value * 100
+    label = "premium to" if premium_discount > 0 else "discount to"
+    st.metric("Implied Fair Value  (Sector Avg P/E × EPS)", f"${fair_value:,.2f}",
+              f"{premium_discount:+.1f}% ({label} fair value)", delta_color="inverse")
+    st.caption(
+        f"Fair value = sector avg P/E **{sector_pe:.1f}x** × EPS **${trailing_eps:,.2f}** "
+        f"= **${fair_value:,.2f}**, vs current price ${current_price:,.2f}."
+    )
+else:
+    st.metric("Implied Fair Value  (Sector Avg P/E × EPS)", "N/A")
+    st.caption(
+        "Needs both a sector average P/E and a positive company EPS — one wasn't "
+        "available for this ticker (e.g. the company is unprofitable, or peer data "
+        "was rate-limited)."
+    )
+
+with st.expander(f"Peer group used for the sector average ({', '.join(peers) if peers else 'none'})"):
+    valid = sector["valid_peers"]
+    if valid:
+        peer_df = pd.DataFrame(
+            [{"Ticker": r["ticker"], "Trailing P/E": round(r["pe"], 1)} for r in valid]
+        )
+        st.dataframe(peer_df, hide_index=True, use_container_width=True)
+        if sector["mean_pe"] and sector_pe:
+            st.caption(
+                f"Median P/E **{sector_pe:.1f}x** vs mean **{sector['mean_pe']:.1f}x** — the "
+                "median is used to resist mega-cap outliers. Negative and >200 P/E peers filtered out."
+            )
+    else:
+        st.write("No valid peer P/E data returned.")
 
 st.divider()
 

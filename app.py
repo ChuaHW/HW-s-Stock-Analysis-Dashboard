@@ -546,8 +546,29 @@ st.write("")
 
 h1, h2, h3, h4 = st.columns(4)
 h1.metric("Price", f"${current_price:,.2f}", f"{price_change:+.2f} ({price_change_pct:+.2f}%)")
-h2.metric("Trend", trend, f"{(current_price - sma_50):+.2f} vs 50-SMA" if sma_50 else None,
-          delta_color="off")
+
+# Trend as a colored card: green box for Uptrend, red for Downtrend.
+trend_color = SUPPORT_GREEN if trend == "Uptrend" else RESIST_RED if trend == "Downtrend" else MUTED
+trend_tint = (
+    "rgba(55,201,120,0.14)" if trend == "Uptrend"
+    else "rgba(240,96,60,0.14)" if trend == "Downtrend"
+    else "rgba(154,145,134,0.12)"
+)
+trend_sub = f"{(current_price - sma_50):+.2f} vs 50-SMA" if sma_50 else "&nbsp;"
+h2.markdown(
+    f"""
+    <div style="background:{trend_tint}; border:1px solid {trend_color}; border-radius:14px;
+                padding:14px 18px;">
+      <div style="color:{MUTED}; font-weight:600; text-transform:uppercase;
+                  letter-spacing:.05em; font-size:.72rem;">Trend</div>
+      <div style="color:{trend_color}; font-weight:800; font-size:1.9rem;
+                  line-height:1.25;">{trend}</div>
+      <div style="color:{MUTED}; font-size:.8rem;">{trend_sub}</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 h3.metric("50-Day SMA", f"${sma_50:,.2f}" if sma_50 else "N/A")
 h4.metric("Next Earnings", next_earnings)
 
@@ -689,15 +710,35 @@ if targets and isinstance(targets.get("mean"), (int, float)):
     n = targets.get("count")
     st.caption(f"Source: {targets.get('source')}" + (f" · {n} analysts" if n else ""))
 
-    chart_df = pd.DataFrame(
-        {"Price ($)": {
-            "Min": targets.get("low"), "Current": current_price,
-            "Avg": targets.get("mean"), "Max": targets.get("high"),
-        }}
-    )
-    chart_df = chart_df[chart_df["Price ($)"].apply(lambda v: isinstance(v, (int, float)) and v > 0)]
-    if not chart_df.empty:
-        st.bar_chart(chart_df, color=ACCENT)
+    bars = [
+        (lbl, v) for lbl, v in [
+            ("Min", targets.get("low")), ("Current", current_price),
+            ("Avg", targets.get("mean")), ("Max", targets.get("high")),
+        ] if isinstance(v, (int, float)) and v > 0
+    ]
+    if bars:
+        # Green if the target is above the current price, red if below,
+        # neutral for the current-price reference bar itself.
+        colors = [
+            MUTED if abs(v - current_price) < 1e-9
+            else SUPPORT_GREEN if v > current_price
+            else RESIST_RED
+            for _, v in bars
+        ]
+        bar_fig = go.Figure(
+            go.Bar(
+                x=[b[0] for b in bars], y=[b[1] for b in bars],
+                marker_color=colors,
+                text=[f"${v:,.2f}" for _, v in bars], textposition="outside",
+            )
+        )
+        bar_fig.update_layout(
+            height=320, margin=dict(l=10, r=10, t=30, b=10),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor=CHART_BG,
+            font=dict(family="Inter, sans-serif", color=INK),
+            yaxis=dict(gridcolor=GRID, title="Price ($)"), xaxis=dict(gridcolor=GRID),
+        )
+        st.plotly_chart(bar_fig, use_container_width=True)
 else:
     st.info(
         "No analyst price targets available. Set FMP_API_KEY (free at "
